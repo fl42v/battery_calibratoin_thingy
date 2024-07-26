@@ -1,0 +1,154 @@
+let ac = "/sys/class/power_supply/AC"
+let min_voltage = 9.6
+let max_voltage = 12.6
+
+fun err(stuff)   { unsafe $gum log -l error "{stuff}"$ }
+fun fatal(stuff) { unsafe $gum log -l fatal "{stuff}"$ }
+fun info(stuff)  { unsafe $gum log -l info  "{stuff}"$ }
+fun warn(stuff)  { unsafe $gum log -l warn  "{stuff}"$ }
+
+fun get_voltage(battery) {
+  return unsafe $cat {battery}/voltage_now$ as Num / 1000000
+}
+
+fun get_status(battery) {
+  return unsafe $cat {battery}/status$
+}
+
+fun actual_stats(battery) {
+  let state = unsafe $cat {battery}/status$
+  let energy_now = unsafe $cat {battery}/energy_now$ as Num / 1000000
+  let energy_full = unsafe $cat {battery}/energy_full$ as Num / 1000000
+  let energy_full_design = unsafe $cat {battery}/energy_full_design$ as Num / 1000000
+  let voltage_now = get_voltage(battery)
+  let capacity = unsafe $cat {battery}/capacity$
+  let charge_behaviour = unsafe $cat {battery}/charge_behaviour$
+
+  echo "\tStatus: {state}      "
+  echo "\tCapacity: {capacity}      "
+  echo "\tCharge behaviour: {charge_behaviour}      "
+  echo "\tEnergy stored: {energy_now} Wh      "
+  echo "\tEnergy full/design: {energy_full}/{energy_full_design} Wh      "
+  echo "\tVoltage now: {voltage_now} V      "
+
+}
+
+fun print_stats(battery) {
+  let bat_name = unsafe $echo {battery} | rev | cut -d '/' -f 1 | rev$
+  info("Current stats of {bat_name} (as seen by the bms):")
+  actual_stats(battery)
+}
+
+fun redraw_stats(battery) {
+  unsafe $tput cuu 6$ // 6 lines up (gum is slow asf, so we're not redrawing it)
+  actual_stats(battery)
+}
+
+fun detect_ac(){
+  silent $ls "{ac}"$ failed {
+    warn("Can't find the laptop's power supply directory. Please, specify manually.")
+    ac = unsafe $gum choose /sys/class/power_supply/*$ //*/
+  }
+
+  let online = $cat {ac}/online$ failed {
+    err("{ac}/online is not present or inaccessible")
+  }
+
+  if online == "0" {
+    // TODO: implement the --no-charge flag
+    err("Power supply not connected. Connect it and try again")
+    fail 1
+  }
+}
+
+fun set_charge_behaviour(charge_behaviour, battery) {
+  info("Setting charge_behaviour to {charge_behaviour}")
+  $echo "{charge_behaviour}" > {battery}/charge_behaviour$ ?
+}
+
+fun charge_cycle(battery) {
+  // TODO: mb loop charge-discharge stuff 'til the battery reaches exactly max_voltage
+  info("Started charge cycle.")
+  unsafe set_charge_behaviour("auto", battery)
+  print_stats(battery)
+  loop {
+    if get_voltage(battery) >= max_voltage or get_status(battery) == "Not charging" or get_status(battery) == "Full" {
+      info("Battery voltage reached {max_voltage}, stopping charge cycle.")
+      unsafe set_charge_behaviour("inhibit-charge", battery)
+      break
+    }
+    unsafe $sleep 5$
+    redraw_stats(battery)
+  }
+
+}
+
+fun discharge_cycle(battery) {
+  info("Started charge cycle.")
+  unsafe set_charge_behaviour("force-discharge", battery)
+  // TODO: custom discharge command
+  let pid = unsafe $stress-ng --cpu 8 --cpu-method matrixprod --metrics-brief --perf &>/dev/null & echo \$! $
+  print_stats(battery)
+  loop {
+    if get_voltage(battery) <= min_voltage {
+      info("Battery voltage reached {min_voltage}, stopping discharge cycle.")
+      unsafe $kill {pid}$
+      break
+    }
+    unsafe $sleep 5$
+    redraw_stats(battery)
+  }
+}
+
+main {
+  $gum log -l info "Availeable batteries:"$ failed {
+    echo "Seems like gum is not installed. Make sure it is and try again."
+    fail 1
+  }
+
+  let battery = unsafe $gum choose --select-if-one /sys/class/power_supply/BAT*$
+  print_stats(battery)
+
+  let battery_cells = unsafe $gum choose 2 3 4 --header "How many sequential cells does the battery have:"$ as Num
+  min_voltage = 3.2 * battery_cells + 0.1
+  max_voltage = 4.2 * battery_cells + 0.1
+  info("Discharging down to {min_voltage }")
+  info("Charging up to {max_voltage}")
+  fail 1
+
+  set_charge_behaviour("auto", battery) failed {
+    fatal("Can't write to {battery}/charge_behaviour. I suggest re-running the script with root privilleges (sudo).")
+    fail 1
+  }
+
+  let has_sysd = true
+  silent $which systemctl$ failed {
+    unsafe $gum confirm --affirmative="Ok" --negative="" "Seem to be running on a non-systemd distro. Stop upower if you're using it and press ok"$
+    has_sysd = false
+  }
+
+  if has_sysd {
+    let has_upower = true
+    silent $systemctl list-unit-files | grep upower$ failed {
+      has_upower = false
+    }
+    if has_upower {
+      info("Detected upower. Stopping it.")
+      unsafe $systemctl stop upower$
+    }
+  }
+
+  detect_ac()?
+
+  unsafe $gum confirm --affirmative="Ok" --negative="" "About to start cycling the battery. The process is infinite, you can Ctrl-c at any moment."$
+
+  $gum confirm "Go straight to discharge cycle?"$ failed {
+    charge_cycle(battery)
+  }
+
+  loop {
+    discharge_cycle(battery)
+    charge_cycle(battery)
+  }
+
+}
